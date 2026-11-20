@@ -46,7 +46,9 @@ export async function POST(req: NextRequest) {
     const contentType = req.headers.get("content-type") || "";
     if (contentType.includes("multipart/form-data")) {
       const formData = await req.formData();
-      const file = formData.get("file") as File | null || formData.get("image") as File | null;
+      const file =
+        (formData.get("file") as File | null) ||
+        (formData.get("image") as File | null);
 
       if (!file) {
         return NextResponse.json(
@@ -127,11 +129,13 @@ For EACH dish:
           properties: {
             is_menu: {
               type: "BOOLEAN",
-              description: "True if readable food menu, false if blurry, dark, unreadable or not a menu",
+              description:
+                "True if readable food menu, false if blurry, dark, unreadable or not a menu",
             },
             blur_or_unclear_reason: {
               type: "STRING",
-              description: "Friendly reason if photo is blurry, unreadable, or not a menu",
+              description:
+                "Friendly reason if photo is blurry, unreadable, or not a menu",
             },
             restaurant_name: {
               type: "STRING",
@@ -176,35 +180,59 @@ For EACH dish:
       },
     };
 
-    // 4. Send request to Gemini API (try gemini-1.5-flash, fallback to gemini-2.0-flash / gemini-1.5-pro)
-    const models = ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"];
+    // 4. Send request to Gemini API (try active working models in sequence)
+    const models = [
+      "gemini-flash-lite-latest",
+      "gemini-flash-latest",
+      "gemini-pro-latest",
+      "gemini-3.8-flash",
+      "gemini-2.5-pro",
+      "gemini-1.5-flash",
+    ];
     let geminiResponse: Response | null = null;
     let selectedModel = models[0];
 
     for (const model of models) {
       selectedModel = model;
       const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(requestBody),
-      });
+      try {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(requestBody),
+        });
 
-      if (res.status !== 404) {
+        // If success or valid client error (422/400), break and use it
+        if (res.ok) {
+          geminiResponse = res;
+          break;
+        }
+
+        // If 404 (model not found for this key), try next model
+        if (res.status === 404 || res.status === 503) {
+          continue;
+        }
+
+        // If bad request/forbidden, stop and report
         geminiResponse = res;
         break;
+      } catch (e) {
+        console.warn(`Model ${model} fetch failed, trying next...`, e);
       }
     }
 
     if (!geminiResponse || !geminiResponse.ok) {
-      const errText = geminiResponse ? await geminiResponse.text() : "No response from Gemini API";
+      const errText = geminiResponse
+        ? await geminiResponse.text()
+        : "No response from Gemini API";
       console.error("Gemini API Error:", errText);
 
       // Check for quota / invalid key
       if (geminiResponse?.status === 400 || geminiResponse?.status === 403) {
         return NextResponse.json(
           {
-            error: "Gemini API rejected request. Please check that your GEMINI_API_KEY in .env.local is valid and active.",
+            error:
+              "Gemini API rejected request. Please check that your GEMINI_API_KEY in .env.local is valid and active.",
             code: "INVALID_API_KEY",
             details: errText,
           },
@@ -214,7 +242,8 @@ For EACH dish:
 
       return NextResponse.json(
         {
-          error: "Failed to process menu photo with Gemini Vision. Please try again.",
+          error:
+            "Failed to process menu photo with Gemini Vision. Please try again.",
           code: "GEMINI_ERROR",
           details: errText,
         },
@@ -288,7 +317,9 @@ For EACH dish:
     console.error("API /api/analyze exception:", err);
     return NextResponse.json(
       {
-        error: err.message || "An unexpected error occurred while analyzing the menu.",
+        error:
+          err.message ||
+          "An unexpected error occurred while analyzing the menu.",
         code: "SERVER_ERROR",
       },
       { status: 500 }
