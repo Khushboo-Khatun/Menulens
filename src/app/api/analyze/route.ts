@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
 export const maxDuration = 60; // 60s timeout for vision AI processing
+export const runtime = "nodejs"; // Ensure route runs on Node.js runtime
 
 interface GeminiDishItem {
   name: string;
@@ -26,13 +27,13 @@ interface GeminiAnalysisResponse {
 
 export async function POST(req: NextRequest) {
   try {
-    // 1. Verify API Key from environment (.env.local) - never sent to frontend
+    // 1. Verify API Key from environment (.env.local / Vercel Env) - never sent to frontend
     const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
     if (!apiKey || apiKey.trim() === "") {
       return NextResponse.json(
         {
           error:
-            "Gemini API key is not configured. Please add your GEMINI_API_KEY to .env.local to enable live menu OCR.",
+            "Gemini API key is not configured. Please add your GEMINI_API_KEY to your environment variables to enable live menu OCR.",
           code: "MISSING_API_KEY",
         },
         { status: 401 }
@@ -54,6 +55,17 @@ export async function POST(req: NextRequest) {
         return NextResponse.json(
           { error: "No image file provided in request.", code: "NO_FILE" },
           { status: 400 }
+        );
+      }
+
+      // Check file size (max 4.5MB serverless limit safeguard)
+      if (file.size > 4.5 * 1024 * 1024) {
+        return NextResponse.json(
+          {
+            error: "Uploaded image is too large (max 4MB allowed).",
+            code: "PAYLOAD_TOO_LARGE",
+          },
+          { status: 413 }
         );
       }
 
@@ -202,18 +214,18 @@ For EACH dish:
           body: JSON.stringify(requestBody),
         });
 
-        // If success or valid client error (422/400), break and use it
+        // If success, break and use it
         if (res.ok) {
           geminiResponse = res;
           break;
         }
 
-        // If 404 (model not found for this key), try next model
+        // If 404 (model not found for this key) or 503, try next model
         if (res.status === 404 || res.status === 503) {
           continue;
         }
 
-        // If bad request/forbidden, stop and report
+        // If bad request/quota/forbidden, stop and report
         geminiResponse = res;
         break;
       } catch (e) {
@@ -227,12 +239,37 @@ For EACH dish:
         : "No response from Gemini API";
       console.error("Gemini API Error:", errText);
 
-      // Check for quota / invalid key
+      // Check for rate limit / quota
+      if (geminiResponse?.status === 429) {
+        return NextResponse.json(
+          {
+            error:
+              "Gemini AI rate limit or quota exceeded. Please wait a moment and try again.",
+            code: "RATE_LIMITED",
+            details: errText,
+          },
+          { status: 429 }
+        );
+      }
+
+      // Check for timeout
+      if (geminiResponse?.status === 504 || geminiResponse?.status === 408) {
+        return NextResponse.json(
+          {
+            error: "Gemini AI processing timed out. Please try again.",
+            code: "TIMEOUT",
+            details: errText,
+          },
+          { status: 504 }
+        );
+      }
+
+      // Check for invalid key or permission
       if (geminiResponse?.status === 400 || geminiResponse?.status === 403) {
         return NextResponse.json(
           {
             error:
-              "Gemini API rejected request. Please check that your GEMINI_API_KEY in .env.local is valid and active.",
+              "Gemini API rejected request. Please check that your GEMINI_API_KEY is valid and active.",
             code: "INVALID_API_KEY",
             details: errText,
           },
@@ -318,7 +355,7 @@ For EACH dish:
     return NextResponse.json(
       {
         error:
-          err.message ||
+          err?.message ||
           "An unexpected error occurred while analyzing the menu.",
         code: "SERVER_ERROR",
       },

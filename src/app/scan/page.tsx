@@ -6,6 +6,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { Button } from "@/components/ui/Button";
 import { useScanStore } from "@/store/useScanStore";
 import { useUserStore } from "@/store/useUserStore";
+import { compressImage } from "@/lib/image-compress";
 import {
   Camera,
   X,
@@ -14,12 +15,8 @@ import {
   AlertTriangle,
   Upload,
   RefreshCw,
-  Image as ImageIcon,
   KeyRound,
-  FileQuestion,
-  ChevronRight,
 } from "lucide-react";
-import { cn } from "@/lib/utils";
 
 export default function ScanPage() {
   const router = useRouter();
@@ -44,7 +41,7 @@ export default function ScanPage() {
     if (!isAnalyzing) return;
 
     setProgress(15);
-    setStatusMessage("Uploading menu photo securely...");
+    setStatusMessage("Uploading compressed menu photo...");
 
     const t1 = setTimeout(() => {
       setProgress(40);
@@ -68,57 +65,143 @@ export default function ScanPage() {
     };
   }, [isAnalyzing, profile.diet]);
 
-  // Handle image selection from Camera or Gallery
+  // Handle image selection from Camera or Gallery with client-side compression
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    setErrorInfo(null);
-    const previewUrl = URL.createObjectURL(file);
-    setSelectedImage(previewUrl);
+    // Reset input value so the same file can be re-selected if retried
+    e.target.value = "";
 
-    await uploadAndAnalyzePhoto(file, previewUrl);
+    setErrorInfo(null);
+    setIsAnalyzing(true);
+    setStatusMessage("Compressing menu photo...");
+    setProgress(10);
+
+    try {
+      // 1. Client-side compression: resize longest side to max 1400px, JPEG quality 0.75
+      const { blob, previewUrl } = await compressImage(file, 1400, 0.75);
+      setSelectedImage(previewUrl);
+
+      await uploadAndAnalyzePhoto(blob, previewUrl);
+    } catch (compressionErr) {
+      console.error("Client image compression error, using original file:", compressionErr);
+      const fallbackUrl = URL.createObjectURL(file);
+      setSelectedImage(fallbackUrl);
+      await uploadAndAnalyzePhoto(file, fallbackUrl);
+    }
   };
 
   // Upload photo to backend route /api/analyze
-  const uploadAndAnalyzePhoto = async (file: File | Blob, previewUrl: string) => {
+  const uploadAndAnalyzePhoto = async (fileOrBlob: File | Blob, previewUrl: string) => {
     setIsAnalyzing(true);
     setErrorInfo(null);
 
     try {
       const formData = new FormData();
-      formData.append("file", file);
+      formData.append("file", fileOrBlob, "menu.jpg");
 
-      const res = await fetch("/api/analyze", {
-        method: "POST",
-        body: formData,
-      });
+      // Set up client-side 55s timeout abort
+      const abortController = new AbortController();
+      const timeoutTimer = setTimeout(() => {
+        abortController.abort();
+      }, 55000);
 
-      const data = await res.json();
+      let res: Response;
+      try {
+        res = await fetch("/api/analyze", {
+          method: "POST",
+          body: formData,
+          signal: abortController.signal,
+        });
+      } finally {
+        clearTimeout(timeoutTimer);
+      }
+
+      // Read response content safely as JSON or text
+      let data: any = null;
+      const contentType = res.headers.get("content-type") || "";
+      if (contentType.includes("application/json")) {
+        try {
+          data = await res.json();
+        } catch (jsonErr) {
+          console.error("Failed to parse JSON response:", jsonErr);
+        }
+      } else {
+        const rawText = await res.text();
+        console.error("Server returned non-JSON response:", res.status, rawText);
+        data = { error: rawText?.slice(0, 300) };
+      }
 
       if (!res.ok) {
         setIsAnalyzing(false);
+        console.error("API error response from /api/analyze:", {
+          status: res.status,
+          statusText: res.statusText,
+          data,
+        });
 
-        if (data.code === "MISSING_API_KEY") {
+        // Specific friendly error messages by HTTP status code
+        if (res.status === 413) {
           setErrorInfo({
-            code: "MISSING_API_KEY",
-            title: "Gemini API Key Required",
+            code: "PAYLOAD_TOO_LARGE",
+            title: "Photo Too Large (413)",
             message:
-              "Please add your GEMINI_API_KEY to .env.local to enable live AI menu photo scanning.",
+              "The menu image exceeds the upload limit. Please take a closer photo or use our Demo Menu.",
           });
-        } else if (data.code === "BLURRY_OR_UNCLEAR" || res.status === 422) {
+        } else if (res.status === 504 || res.status === 408) {
+          setErrorInfo({
+            code: "TIMEOUT",
+            title: "Analysis Timed Out (504)",
+            message:
+              "Gemini AI took too long to read the menu photo. Please check your network or try with a clearer, steady shot.",
+          });
+        } else if (res.status === 429) {
+          setErrorInfo({
+            code: "RATE_LIMITED",
+            title: "AI Quota Exceeded (429)",
+            message:
+              "Too many menu scans in a short time. Please wait 30 seconds and try again.",
+          });
+        } else if (res.status === 401) {
+          if (data?.code === "MISSING_API_KEY") {
+            setErrorInfo({
+              code: "MISSING_API_KEY",
+              title: "Gemini API Key Required",
+              message:
+                "Please add your GEMINI_API_KEY to your environment variables to enable live AI menu scanning.",
+            });
+          } else {
+            setErrorInfo({
+              code: "UNAUTHORIZED",
+              title: "Vercel Authentication Active",
+              message:
+                "This deployment is protected by Vercel Authentication. Please disable Deployment Protection in your Vercel project settings.",
+            });
+          }
+        } else if (res.status === 422 || data?.code === "BLURRY_OR_UNCLEAR") {
           setErrorInfo({
             code: "BLURRY_OR_UNCLEAR",
             title: "Photo Too Blurry or Unclear",
             message:
-              data.error ||
+              data?.error ||
               "The camera couldn't read the menu text clearly. Please hold steady with good lighting and avoid shadows or glares.",
+          });
+        } else if (res.status >= 500) {
+          setErrorInfo({
+            code: "SERVER_ERROR",
+            title: "Server Error (500)",
+            message:
+              data?.error ||
+              "An internal server error occurred while analyzing the menu. Please retry.",
           });
         } else {
           setErrorInfo({
-            code: data.code || "ERROR",
+            code: data?.code || "ERROR",
             title: "Could Not Analyze Menu",
-            message: data.error || "An error occurred while analyzing the menu photo. Please try again.",
+            message:
+              data?.error ||
+              `Request failed with status ${res.status}. Please try again.`,
           });
         }
         return;
@@ -126,7 +209,7 @@ export default function ScanPage() {
 
       // Success: Valid JSON returned from Gemini
       setProgress(100);
-      setStatusMessage(`Complete! ${data.dishes.length} dishes identified & scored.`);
+      setStatusMessage(`Complete! ${data.dishes?.length || 0} dishes identified & scored.`);
 
       // Give user 600ms to appreciate the 100% checkmark before transition
       setTimeout(() => {
@@ -134,13 +217,24 @@ export default function ScanPage() {
         router.push("/results");
       }, 700);
     } catch (err: any) {
-      console.error("Scan upload error:", err);
+      console.error("Scan upload network error:", err);
       setIsAnalyzing(false);
-      setErrorInfo({
-        code: "NETWORK_ERROR",
-        title: "Connection Failed",
-        message: "Failed to connect to the /api/analyze server. Please verify your connection.",
-      });
+
+      if (err.name === "AbortError") {
+        setErrorInfo({
+          code: "TIMEOUT",
+          title: "Request Timed Out",
+          message:
+            "The upload took too long. Please ensure you have a stable network connection and try again.",
+        });
+      } else {
+        setErrorInfo({
+          code: "NETWORK_ERROR",
+          title: "Connection Failed",
+          message:
+            "Failed to connect to the /api/analyze server. Please check your internet connection or verify Vercel Deployment Protection.",
+        });
+      }
     }
   };
 
@@ -299,7 +393,7 @@ export default function ScanPage() {
         </div>
       </div>
 
-      {/* Friendly Error State for Blurry Photo or Missing Key */}
+      {/* Friendly Error State for Blurry Photo, Timeout, Large File, or Missing Key */}
       <AnimatePresence>
         {errorInfo && (
           <motion.div
